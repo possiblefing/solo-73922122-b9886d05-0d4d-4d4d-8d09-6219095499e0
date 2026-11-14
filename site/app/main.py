@@ -27,6 +27,11 @@ DEFAULT_RATE_LIMIT = int(os.getenv("SITE_RATE_LIMIT", "12"))
 DEFAULT_WINDOW = float(os.getenv("SITE_RATE_WINDOW", "10"))
 DEFAULT_LATENCY_MS = int(os.getenv("SITE_LATENCY_MS", "150"))
 RETRY_AFTER_SECONDS = int(os.getenv("SITE_RETRY_AFTER", "5"))
+# 0 = report the page count implied by the dataset; a positive value makes the
+# list pages advertise that many pages so lazy pagination can be exercised.
+DEFAULT_TOTAL_PAGES = int(os.getenv("SITE_TOTAL_PAGES", "0"))
+MAX_TOTAL_PAGES = 1_000_000
+PAGER_LINK_WINDOW = 5
 
 
 class SlidingWindowLimiter:
@@ -55,6 +60,7 @@ state: dict = {}
 async def lifespan(app: FastAPI):
     state["limiter_enabled"] = os.getenv("SITE_RATE_ENABLED", "true").lower() == "true"
     state["latency_ms"] = DEFAULT_LATENCY_MS
+    state["total_pages_override"] = DEFAULT_TOTAL_PAGES
     state["limiter"] = SlidingWindowLimiter(DEFAULT_RATE_LIMIT, DEFAULT_WINDOW)
     yield
 
@@ -117,9 +123,17 @@ button {{ margin-top: 18px; padding: 10px 26px; background: #1e3a8a; color: #fff
 
 def _render_list(section: str, section_title: str, page: int) -> HTMLResponse:
     rows = section_rows(section)
-    total_pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
+    real_pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
+    override = int(state.get("total_pages_override", 0) or 0)
+    total_pages = override if override > 0 else real_pages
     page = max(1, min(page, total_pages))
-    window_rows = rows[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
+    if page <= real_pages:
+        window_rows = rows[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
+    else:
+        # Beyond the dataset the mock keeps serving a deterministic page so the
+        # collector can keep walking a very large advertised page count.  The
+        # announcement codes repeat, which also exercises cross-page dedup.
+        window_rows = rows[:PAGE_SIZE]
 
     trs = "".join(
         f"""<tr class="announcement">
@@ -128,10 +142,16 @@ def _render_list(section: str, section_title: str, page: int) -> HTMLResponse:
         <td>{a.unit}</td><td>{a.deadline}</td></tr>"""
         for a in window_rows
     )
+    # Never render one anchor per advertised page: with a large page count the
+    # page links are a small window around the current page plus first/last.
+    link_numbers = sorted(
+        {1, total_pages}
+        | set(range(max(1, page - PAGER_LINK_WINDOW), min(total_pages, page + PAGER_LINK_WINDOW) + 1))
+    )
     page_links = "".join(
         f'<a class="page-link {"current" if n == page else ""}" '
         f'href="/{section}?page={n}">{n}</a>'
-        for n in range(1, total_pages + 1)
+        for n in link_numbers
     )
     body = f"""<h1>{section_title}</h1>
 <table id="announcement-list">
@@ -204,6 +224,8 @@ async def admin_page():
   <input type="number" name="window" step="0.5" min="1" value="{limiter.window}"/>
   <label>每请求人工延迟（毫秒，0 表示关闭）</label>
   <input type="number" name="latency_ms" min="0" value="{state.get('latency_ms', 0)}"/>
+  <label>列表总页数覆盖（0 = 按数据集；可设为 200000 等大页数）</label>
+  <input type="number" name="total_pages" min="0" max="{MAX_TOTAL_PAGES}" value="{state.get('total_pages_override', 0)}"/>
   <br/><button type="submit">保存并重置计数</button>
 </form>
 <form method="post" action="/admin/reset" style="margin-top:8px">
@@ -220,6 +242,7 @@ async def admin_config(
     limit: int = Form(...),
     window: float = Form(...),
     latency_ms: int = Form(...),
+    total_pages: int | None = Form(default=None),
 ):
     limiter: SlidingWindowLimiter = state["limiter"]
     limiter.limit = max(1, limit)
@@ -227,6 +250,8 @@ async def admin_config(
     limiter.reset()
     state["limiter_enabled"] = limiter_enabled == "on"
     state["latency_ms"] = max(0, latency_ms)
+    if total_pages is not None:
+        state["total_pages_override"] = max(0, min(MAX_TOTAL_PAGES, total_pages))
     return RedirectResponse(url="/admin", status_code=303)
 
 
@@ -238,4 +263,8 @@ async def admin_reset():
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "announcements": len(ANNOUNCEMENTS)}
+    return {
+        "status": "ok",
+        "announcements": len(ANNOUNCEMENTS),
+        "total_pages_override": state.get("total_pages_override", 0),
+    }

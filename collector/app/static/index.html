@@ -37,7 +37,7 @@
     .badge.stopped { background: #b91c1c; }
     .badge.completed { background: #047857; }
     .badge.partial { background: #a16207; }
-    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
     .stat { background: #0b1220; border: 1px solid var(--line); border-radius: 8px;
             padding: 12px 14px; }
     .stat .label { color: var(--muted); font-size: 12px; }
@@ -61,6 +61,9 @@
     .muted { color: var(--muted); font-size: 12px; }
     a { color: var(--accent); }
     .table-wrap { max-height: 360px; overflow: auto; }
+    .success-note { margin-top: 12px; font-weight: 700; }
+    .success-note.ok { color: var(--green); }
+    .success-note.bad { color: var(--red); }
   </style>
 </head>
 <body>
@@ -79,17 +82,18 @@
         <a class="btn-site" href="/site/admin" target="_blank" rel="noopener">⚙ 采购站限流/延迟开关</a>
       </div>
       <p class="muted" style="margin-bottom:0;margin-top:10px">
-        目标站点：<span id="baseUrl"></span> ｜ 栏目：招标公告 / 中标公告 ｜ 每页最多尝试 3 次，
-        429 按 Retry-After 整站冷却。
+        目标站点：<span id="baseUrl"></span> ｜ 栏目：招标公告 / 中标公告 ｜ 分页按需调度（不预排全部分页）
+        ｜ 每页最多尝试 3 次，429 按 Retry-After 整站冷却。
       </p>
     </section>
 
     <section class="panel">
       <h2>实时进度</h2>
       <div class="grid">
-        <div class="stat"><div class="label">已入队页面</div><div class="value" id="enqueued">0</div></div>
+        <div class="stat"><div class="label">已调度页面</div><div class="value" id="enqueued">0</div></div>
+        <div class="stat"><div class="label">已请求页面</div><div class="value" id="requested">0</div></div>
         <div class="stat"><div class="label">已完成页面</div><div class="value" id="completed">0</div></div>
-        <div class="stat"><div class="label">失败页面</div><div class="value" id="failed" style="color:var(--red)">0</div></div>
+        <div class="stat"><div class="label">失败页面（已请求）</div><div class="value" id="failed" style="color:var(--red)">0</div></div>
         <div class="stat"><div class="label">已提取公告（按编号去重）</div><div class="value" id="records">0</div></div>
       </div>
       <p style="margin:14px 0 0">
@@ -98,19 +102,31 @@
         ｜ 开始：<span id="startedAt" class="muted">—</span>
         ｜ 结束：<span id="finishedAt" class="muted">—</span>
       </p>
+      <p id="successNote" class="success-note"></p>
     </section>
 
     <section class="panel">
-      <h2>分栏目进度</h2>
+      <h2>分栏目进度（列表页按需逐页调度）</h2>
       <div class="section-grid" id="sections"></div>
     </section>
 
     <section class="panel">
-      <h2>未完成页面（耗尽 3 次尝试或解析失败时列入；存在未完成页则本轮不算成功）</h2>
+      <h2>失败页面（已请求但未成功；保留页码/编号与尝试次数）</h2>
       <div class="table-wrap">
         <table>
           <thead><tr><th>栏目</th><th>类型</th><th>页/编号</th><th>尝试次数</th><th>原因</th><th>URL</th></tr></thead>
-          <tbody id="unfinishedBody"><tr><td colspan="6" class="muted">暂无</td></tr></tbody>
+          <tbody id="failedBody"><tr><td colspan="6" class="muted">暂无</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>未请求页面（从未发送请求；按连续页段与数量报告）</h2>
+      <p class="muted" id="unrequestedSummary" style="margin:0 0 10px">暂无</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>栏目</th><th>类型</th><th>页段</th><th>数量</th><th>起始 URL</th></tr></thead>
+          <tbody id="unrequestedBody"><tr><td colspan="5" class="muted">暂无</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -134,7 +150,6 @@
   <script>
     const $ = (id) => document.getElementById(id);
     let timer = null;
-    let lastStatus = "";
 
     function setStatus(s) {
       const badge = $("statusBadge");
@@ -147,6 +162,24 @@
       const busy = s === "running" || s === "stopping";
       $("btnStart").disabled = busy;
       $("btnStop").disabled = s !== "running";
+      $("btnDownload").disabled = false;
+    }
+
+    function renderSuccess(s) {
+      const note = $("successNote");
+      if (s.status === "running" || s.status === "stopping" || s.status === "idle") {
+        note.textContent = ""; note.className = "success-note"; return;
+      }
+      if (s.status === "completed" && s.success) {
+        note.textContent = "本轮采集完成：所有已请求页面均成功，且无未请求页面。";
+        note.className = "success-note ok";
+      } else if (s.status === "stopped") {
+        note.textContent = "本轮已停止：停采不算成功；未请求页面与失败页面见下方。";
+        note.className = "success-note bad";
+      } else {
+        note.textContent = "本轮部分完成：存在失败页面或未请求页面，不算成功。";
+        note.className = "success-note bad";
+      }
     }
 
     function renderSections(sections) {
@@ -155,18 +188,22 @@
       for (const [name, p] of Object.entries(sections)) {
         const card = document.createElement("div");
         card.className = "section-card";
+        const remaining = p.list_total_pages > 0
+          ? Math.max(0, p.list_total_pages - p.list_highest_requested) : "—";
         card.innerHTML = `<h3>${name}</h3>
-          <div class="kv"><span>列表总页数</span><b>${p.list_total_pages}</b></div>
-          <div class="kv"><span>列表完成 / 失败</span><b>${p.list_completed} / ${p.list_failed}</b></div>
-          <div class="kv"><span>详情入队 / 完成 / 失败</span><b>${p.detail_enqueued} / ${p.detail_completed} / ${p.detail_failed}</b></div>
+          <div class="kv"><span>列表总页数</span><b>${p.list_total_pages || "—"}</b></div>
+          <div class="kv"><span>已请求列表页（最高页码）</span><b>${p.list_requested} / ${p.list_highest_requested}</b></div>
+          <div class="kv"><span>尚未请求列表页</span><b>${remaining}</b></div>
+          <div class="kv"><span>列表请求 / 完成 / 失败</span><b>${p.list_requested} / ${p.list_completed} / ${p.list_failed}</b></div>
+          <div class="kv"><span>详情请求 / 完成 / 失败</span><b>${p.detail_requested} / ${p.detail_completed} / ${p.detail_failed}</b></div>
           <div class="kv"><span>重复编号跳过</span><b>${p.duplicated_skipped}</b></div>`;
         box.appendChild(card);
       }
     }
 
-    function renderUnfinished(rows) {
-      const body = $("unfinishedBody");
-      if (!rows.length) {
+    function renderFailed(rows) {
+      const body = $("failedBody");
+      if (!rows || !rows.length) {
         body.innerHTML = '<tr><td colspan="6" class="muted">暂无</td></tr>';
         return;
       }
@@ -174,6 +211,34 @@
         `<tr class="warn"><td>${r.section}</td><td>${r.page_type}</td><td>${r.page}</td>
          <td>${r.attempts}</td><td>${escapeHtml(r.reason)}</td>
          <td><a href="${r.url}" target="_blank" rel="noopener">链接</a></td></tr>`).join("");
+    }
+
+    function rangeLabel(r) {
+      if (r.page_type === "detail") {
+        if (r.codes && r.codes.length) return r.codes.join("、");
+        return "第 " + r.start_page + " 页列表未请求的详情";
+      }
+      if (r.end_page === null || r.end_page === undefined) return "第 " + r.start_page + " 页起（总数未知）";
+      return "第 " + r.start_page + " – " + r.end_page + " 页";
+    }
+
+    function renderUnrequested(report, incomplete) {
+      const body = $("unrequestedBody");
+      const summary = $("unrequestedSummary");
+      const ranges = (report && report.ranges) || [];
+      if (!ranges.length) {
+        summary.textContent = "暂无（全部已请求）";
+        body.innerHTML = '<tr><td colspan="5" class="muted">暂无（全部已请求）</td></tr>';
+        return;
+      }
+      const total = report.count || 0;
+      summary.textContent = "未请求合计：" + total + " 页" +
+        (incomplete ? "（至少；站点未披露总页数，存在数量未知的页段）" : "");
+      summary.className = "muted";
+      body.innerHTML = ranges.map(r =>
+        `<tr><td>${r.section}</td><td>${r.page_type}</td><td>${escapeHtml(rangeLabel(r))}</td>
+         <td>${r.count === null ? "未知" : r.count}</td>
+         <td>${r.url ? `<a href="${r.url}" target="_blank" rel="noopener">链接</a>` : "—"}</td></tr>`).join("");
     }
 
     async function loadRecords() {
@@ -199,8 +264,10 @@
       const resp = await fetch("/api/state");
       const s = await resp.json();
       setStatus(s.status);
+      renderSuccess(s);
       $("baseUrl").textContent = s.base_url;
       $("enqueued").textContent = s.pages_enqueued;
+      $("requested").textContent = s.pages_requested;
       $("completed").textContent = s.pages_completed;
       $("failed").textContent = s.pages_failed;
       $("records").textContent = s.records_count;
@@ -209,9 +276,10 @@
       $("startedAt").textContent = s.started_at ? s.started_at.replace("T", " ").slice(0, 19) : "—";
       $("finishedAt").textContent = s.finished_at ? s.finished_at.replace("T", " ").slice(0, 19) : "—";
       renderSections(s.sections);
-      renderUnfinished(s.unfinished);
+      renderFailed(s.failed_pages);
+      renderUnrequested(s.unrequested_pages, s.unrequested_count_incomplete);
       $("events").innerHTML = s.events.slice().reverse().map(e =>
-        `<div class="${e.includes("429") || e.includes("unfinished") || e.includes("error") ? "warn" : ""}">${escapeHtml(e)}</div>`).join("");
+        `<div class="${e.includes("429") || e.includes("failed") || e.includes("unrequested") || e.includes("error") ? "warn" : ""}">${escapeHtml(e)}</div>`).join("");
       await loadRecords();
       if (s.status !== "running" && s.status !== "stopping" && timer) {
         clearInterval(timer); timer = null;

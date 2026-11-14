@@ -11,6 +11,9 @@ services:
       SITE_RATE_WINDOW: "10"
       SITE_LATENCY_MS: "150"
       SITE_RETRY_AFTER: "5"
+      # 0 = page count implied by the dataset.  Set (or change at /admin) to a
+      # large value such as 200000 to exercise lazy pagination end to end.
+      SITE_TOTAL_PAGES: "0"
     ports:
       - "8080:8080"
     healthcheck:

@@ -22,6 +22,39 @@ app = FastAPI(title="Procurement Announcement Collector", version="1.0.0")
 crawler = Crawler(base_url=BASE_URL, sections=SECTIONS)
 
 
+def _summary() -> dict:
+    """Round snapshot with the remainder split into two disjoint reports.
+
+    ``failed_pages`` are pages that were actually requested and did not
+    succeed; each keeps its page number/code and attempt count.
+    ``unrequested_pages`` are pages that were never requested, reported as
+    contiguous ranges plus a total count.  ``success`` is only true for a
+    completed round, never for a stopped one.
+    """
+    state = crawler.snapshot()
+    return {
+        "round_id": state["round_id"],
+        "status": state["status"],
+        "success": state["success"],
+        "base_url": state["base_url"],
+        "started_at": state["started_at"],
+        "finished_at": state["finished_at"],
+        "stop_requested": state["stop_requested"],
+        "cooldown_remaining_seconds": state["cooldown_remaining_seconds"],
+        "pages_enqueued": state["pages_enqueued"],
+        "pages_requested": state["pages_requested"],
+        "pages_completed": state["pages_completed"],
+        "pages_failed": state["pages_failed"],
+        "records_count": state["records_count"],
+        "sections": state["sections"],
+        "failed_pages": state["failed_pages"],
+        "unrequested_pages": state["unrequested_pages"],
+        "unrequested_count": state["unrequested_count"],
+        "unrequested_count_incomplete": state["unrequested_count_incomplete"],
+        "events": state["events"],
+    }
+
+
 @app.get("/api/health")
 async def health() -> dict:
     return {"status": "ok"}
@@ -38,13 +71,21 @@ async def start_round() -> dict:
 
 @app.post("/api/rounds/stop")
 async def stop_round() -> dict:
+    # stop_round only returns once it has accepted the stop, aborted in-flight
+    # requests, recycled the connection pool and wound the round down.
     await crawler.stop_round()
     return {"state": crawler.snapshot()}
 
 
 @app.get("/api/state")
 async def get_state() -> dict:
+    # Keeps the complete round snapshot, including both remainder reports.
     return crawler.snapshot()
+
+
+@app.get("/api/rounds/current")
+async def current_round() -> dict:
+    return _summary()
 
 
 @app.get("/api/records")
@@ -53,6 +94,7 @@ async def get_records() -> dict:
     return {
         "round_id": state["round_id"],
         "status": state["status"],
+        "success": state["success"],
         "count": len(crawler.records()),
         "records": crawler.records(),
     }
@@ -66,11 +108,20 @@ async def download_records():
     payload = {
         "round_id": state["round_id"],
         "status": state["status"],
+        # A stopped round is never a successful collection, even if some pages
+        # happened to finish before the stop was accepted.
+        "success": state["success"],
         "base_url": state["base_url"],
         "started_at": state["started_at"],
         "finished_at": state["finished_at"],
+        "stop_requested": state["stop_requested"],
         "records_count": len(crawler.records()),
-        "unfinished_pages": state["unfinished"],
+        # Requested but unsuccessful: page number / code and attempts kept.
+        "failed_pages": state["failed_pages"],
+        # Never requested: contiguous locatable ranges plus total count.
+        "unrequested_pages": state["unrequested_pages"],
+        "unrequested_count": state["unrequested_count"],
+        "unrequested_count_incomplete": state["unrequested_count_incomplete"],
         "records": crawler.records(),
     }
     headers = {
